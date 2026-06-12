@@ -1482,8 +1482,9 @@ int main(int argc, char *argv[]) {
 			fprintf(stderr, "usage: wshowkeys [-b|-f|-s #RRGGBB[AA]] [-F font] "
 					"[-t timeout]\n\t[-a top|left|right|bottom] [-m margin] "
 					"[-o output] [-l numOfLengthLimit] [-p]\n"
-					"\t-o: monitor name (e.g. DP-1) or Hyprland monitor ID; "
-					"only shown\n\t    while that monitor is focused\n"
+					"\t-o: monitor name (e.g. DP-1), Hyprland monitor ID, or "
+					"'focused';\n\t    only shown while that monitor is "
+					"focused\n"
 					"\t-p: highlight the mouse pointer (requires Hyprland)\n"
 					"\trunning wshowkeys while another instance is active "
 					"toggles it off\n");
@@ -1566,7 +1567,16 @@ int main(int argc, char *argv[]) {
 	struct wl_output *target_wl_output = NULL;
 	if (output_opt) {
 		char target_name[64];
-		if (str_is_number(output_opt)) {
+		if (strcmp(output_opt, "focused") == 0) {
+			if (!hypr_ok || !state.focused_output[0]) {
+				fprintf(stderr, "Unable to resolve the focused monitor via "
+						"Hyprland IPC\n");
+				ret = 1;
+				goto exit;
+			}
+			snprintf(target_name, sizeof(target_name),
+					"%s", state.focused_output);
+		} else if (str_is_number(output_opt)) {
 			if (!hypr_ok || hypr_monitors(atoi(output_opt), target_name,
 					sizeof(target_name), NULL, 0) != 0) {
 				fprintf(stderr, "Unable to resolve monitor ID %s via "

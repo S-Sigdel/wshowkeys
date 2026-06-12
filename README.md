@@ -45,11 +45,13 @@ press it again to disable:
 
 ```conf
 # SUPER+F8: toggle keystroke + pointer overlay for presenting
-bind = SUPER, F8, exec, wshowkeys -a bottom -m 80 -t 1500 -o 0 -p
+bind = SUPER, F8, exec, wshowkeys -a bottom -m 80 -t 1500 -o focused -p
 ```
 
-This shows keys at the bottom of monitor 0, highlights the pointer, and
-hides everything whenever another monitor has focus. The defaults are
+This shows keys at the bottom of whichever monitor is focused when you
+toggle it on, highlights the pointer, and hides everything whenever
+another monitor has focus. Use a monitor ID or name instead of
+`focused` to always pin to a specific monitor. The defaults are
 tuned for visibility on dark editor/3D-viewport style screens; tweak
 colors per the options below if needed.
 
@@ -78,6 +80,7 @@ wshowkeys [-b|-f|-s #RRGGBB[AA]] [-F font] [-t timeout]
 - `-a top|left|right|bottom`: anchor edge; may be given twice
 - `-m margin`: margin in pixels from the nearest edge
 - `-l lenmax`: maximum displayed length of the key line
-- `-o output`: monitor to show on — Hyprland ID (`hyprctl monitors`) or
-  name. The overlay only appears while this monitor is focused.
+- `-o output`: monitor to show on — Hyprland ID (`hyprctl monitors`),
+  name (`DP-1`), or `focused` to pin to the monitor focused at launch.
+  The overlay only appears while this monitor is focused.
 - `-p`: highlight the mouse pointer with a tracking blob (Hyprland)
