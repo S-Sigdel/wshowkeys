@@ -1,15 +1,21 @@
 #include <assert.h>
+#include <ctype.h>
 #include <errno.h>
 #include <cairo/cairo.h>
+#include <fcntl.h>
 #include <getopt.h>
 #include <libinput.h>
 #include <libudev.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 #include <wayland-client.h>
@@ -21,6 +27,12 @@
 #include "xdg-output-unstable-v1-client-protocol.h"
 
 static struct pool_buffer buffer;
+static struct pool_buffer blob_buffer;
+
+/* Pointer highlight blob: logical pixels */
+#define BLOB_RADIUS 42
+#define BLOB_RING 5
+#define BLOB_PI 3.14159265358979323846
 
 struct wsk_keypress {
 	xkb_keysym_t sym;
@@ -33,7 +45,18 @@ struct wsk_output {
 	struct wl_output *output;
 	int scale;
 	enum wl_output_subpixel subpixel;
+	char name[64];
 	struct wsk_output *next;
+};
+
+/*
+ * Layer surfaces must go through a configure cycle before a buffer may be
+ * attached, both on first map and on every remap after a NULL-buffer unmap.
+ */
+enum wsk_surface_status {
+	SURFACE_UNMAPPED = 0,
+	SURFACE_AWAIT_CONFIGURE,
+	SURFACE_READY,
 };
 
 struct wsk_state {
@@ -83,26 +106,36 @@ struct wsk_state {
 	char prev_combination_keye[128];
 
 	int combination_keye_repetition;
+
+	enum wsk_surface_status surface_status;
+
+	/* -o target output and Hyprland focus gating */
+	char target_output[64];
+	char focused_output[64];
+	bool focus_gated;
+	bool target_focused;
+	int hypr_event_fd;
+	char hypr_buf[256];
+	size_t hypr_buf_len;
+
+	/* -p pointer highlight blob */
+	bool pointer_blob;
+	bool blob_want;
+	bool pointer_motion;
+	struct wl_surface *blob_surface;
+	struct zwlr_layer_surface_v1 *blob_layer;
+	enum wsk_surface_status blob_status;
+	struct wsk_output *blob_output;
+	struct timespec last_blob;
+	char blob_geom_output[64];
+	int blob_mon_x, blob_mon_y, blob_mon_w, blob_mon_h;
 };
 
-/* void logtofile(const char *fmt, ...) { */
-/*   char buf[256]; */
-/*   char cmd[256]; */
-/*   va_list ap; */
-/*   va_start(ap, fmt); */
-/*   vsprintf((char *)buf, fmt, ap); */
-/*   va_end(ap); */
-/*   unsigned int i = strlen((const char *)buf); */
-/*  */
-/*   sprintf(cmd, "echo '%.*s' >> ~/log", i, buf); */
-/*   system(cmd); */
-/* } */
-/*  */
-/* void lognumtofile(unsigned int num) { */
-/*   char cmd[256]; */
-/*   sprintf(cmd, "echo '%x' >> ~/log", num); */
-/*   system(cmd); */
-/* } */
+static volatile sig_atomic_t terminate_requested;
+
+static void handle_signal(int sig) {
+	terminate_requested = 1;
+}
 
 static void cairo_set_source_u32(cairo_t *cairo, uint32_t color) {
 	cairo_set_source_rgba(cairo,
@@ -299,22 +332,34 @@ static void render_frame(struct wsk_state *state) {
 
 	// paint keylink to screen
 	render_to_cairo(cairo, state, scale, &width, &height);
-	if (height / scale != state->height
-			|| width / scale != state->width
-			|| state->width == 0) {
-		// Reconfigure surface
-		if (width == 0 || height == 0) {
-//			wl_surface_attach(state->surface, NULL, 0, 0);
-			;
-		} else {
-			zwlr_layer_surface_v1_set_size(
-					state->layer_surface, width / scale, height / scale);
+	if (width == 0 || height == 0) {
+		// Nothing to show: unmap if currently mapped
+		if (state->surface_status == SURFACE_READY) {
+			wl_surface_attach(state->surface, NULL, 0, 0);
+			wl_surface_commit(state->surface);
 		}
+		if (state->surface_status != SURFACE_AWAIT_CONFIGURE) {
+			state->surface_status = SURFACE_UNMAPPED;
+		}
+	} else if (state->surface_status == SURFACE_UNMAPPED) {
+		// Remap: commit without a buffer and wait for configure
+		zwlr_layer_surface_v1_set_size(
+				state->layer_surface, width / scale, height / scale);
+		wl_surface_commit(state->surface);
+		state->surface_status = SURFACE_AWAIT_CONFIGURE;
+	} else if (state->surface_status == SURFACE_AWAIT_CONFIGURE) {
+		// configure is in flight; it will trigger another render
+		;
+	} else if (height / scale != state->height
+			|| width / scale != state->width) {
+		// Reconfigure surface
+		zwlr_layer_surface_v1_set_size(
+				state->layer_surface, width / scale, height / scale);
 
 		// TODO: this could infinite loop if the compositor assigns us a
 		// different height than what we asked for
 		wl_surface_commit(state->surface);
-	} else if (height > 0) {
+	} else {
 		// Replay recording into shm and send it off
 		if (!create_buffer(state->shm, &buffer, state->width * scale,
 				state->height * scale, WL_SHM_FORMAT_ARGB8888)) {
@@ -364,6 +409,9 @@ static void layer_surface_configure(void *data,
 	state->width = width;
 	state->height = height;
 	zwlr_layer_surface_v1_ack_configure(zwlr_layer_surface_v1, serial);
+	if (state->surface_status == SURFACE_AWAIT_CONFIGURE) {
+		state->surface_status = SURFACE_READY;
+	}
 	set_dirty(state);
 }
 
@@ -517,11 +565,24 @@ static void output_scale(void *data,
 	output->scale = factor;
 }
 
+static void output_name(void *data,
+		struct wl_output *wl_output, const char *name) {
+	struct wsk_output *output = data;
+	snprintf(output->name, sizeof(output->name), "%s", name);
+}
+
+static void output_description(void *data,
+		struct wl_output *wl_output, const char *description) {
+	// Who cares
+}
+
 static const struct wl_output_listener wl_output_listener = {
 	.geometry = output_geometry,
 	.mode = output_mode,
 	.done = output_done,
 	.scale = output_scale,
+	.name = output_name,
+	.description = output_description,
 };
 
 //add keyboard event listen
@@ -545,7 +606,7 @@ static void registry_global(void *data, struct wl_registry *wl_registry,
 	} else if (strcmp(interface, wl_output_interface.name) == 0) {
 		struct wsk_output *output = calloc(1, sizeof(struct wsk_output));
 		output->output = wl_registry_bind(wl_registry,
-				name, &wl_output_interface, 3);
+				name, &wl_output_interface, version >= 4 ? 4 : 3);
 		output->scale = 1;
 		struct wsk_output **link = &state->outputs;
 		while (*link) {
@@ -675,11 +736,17 @@ static void attach_repeat_flag(struct wsk_state *state,int num,int num_len) {
 //listen key keydown and record to keylink
 static void handle_libinput_event(struct wsk_state *state,
 		struct libinput_event *event) {
+	enum libinput_event_type event_type = libinput_event_get_type(event);
+	if (event_type == LIBINPUT_EVENT_POINTER_MOTION
+			|| event_type == LIBINPUT_EVENT_POINTER_MOTION_ABSOLUTE) {
+		state->pointer_motion = true;
+		return;
+	}
+
 	if (!state->xkb_state) {
 		return;
 	}
 
-	enum libinput_event_type event_type = libinput_event_get_type(event);
 	if (event_type != LIBINPUT_EVENT_KEYBOARD_KEY) {
 		return;
 	}
@@ -733,7 +800,8 @@ static void handle_libinput_event(struct wsk_state *state,
 			} else if(strcmp(keypress->name,"Shift_R")==0){
 				state->shift_r_hold = 0;
 			}
-		} 
+		}
+		free(keypress);
 		break;
 	case LIBINPUT_KEY_STATE_PRESSED:
 		//if 'ctrl shift alt super' press,mark it's press state
@@ -755,6 +823,10 @@ static void handle_libinput_event(struct wsk_state *state,
 			} else if(strcmp(keypress->name,"Shift_R")==0){
 				state->shift_r_hold = 1;
 			}
+			free(keypress);
+		} else if (state->focus_gated && !state->target_focused) {
+			// target monitor not focused: don't record anything
+			free(keypress);
 		} else {
 			struct wsk_keypress **link = &state->keys;
 			//get the end of the output keylink
@@ -905,6 +977,417 @@ void clear_full_keylink(struct wsk_keypress *key,struct wsk_state *state) {
 	set_dirty(state);
 }
 
+/*
+ * Hyprland IPC. Used to resolve -o monitor IDs to names, to track which
+ * monitor is focused, and to read the cursor position for -p.
+ */
+static int hypr_sock_path(char *buf, size_t len, const char *file) {
+	const char *his = getenv("HYPRLAND_INSTANCE_SIGNATURE");
+	if (!his || !his[0]) {
+		return -1;
+	}
+	const char *xdg = getenv("XDG_RUNTIME_DIR");
+	int n;
+	if (xdg && xdg[0]) {
+		n = snprintf(buf, len, "%s/hypr/%s/%s", xdg, his, file);
+		if (n > 0 && (size_t)n < len && access(buf, F_OK) == 0) {
+			return 0;
+		}
+	}
+	n = snprintf(buf, len, "/tmp/hypr/%s/%s", his, file);
+	if (n > 0 && (size_t)n < len && access(buf, F_OK) == 0) {
+		return 0;
+	}
+	return -1;
+}
+
+static int hypr_connect(const char *file) {
+	char path[256];
+	if (hypr_sock_path(path, sizeof(path), file) != 0) {
+		return -1;
+	}
+	int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+	if (fd < 0) {
+		return -1;
+	}
+	struct sockaddr_un addr = { .sun_family = AF_UNIX };
+	if (strlen(path) >= sizeof(addr.sun_path)) {
+		close(fd);
+		return -1;
+	}
+	strcpy(addr.sun_path, path);
+	if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+		close(fd);
+		return -1;
+	}
+	return fd;
+}
+
+static ssize_t hypr_query(const char *cmd, char *buf, size_t buflen) {
+	int fd = hypr_connect(".socket.sock");
+	if (fd < 0) {
+		return -1;
+	}
+	size_t cmdlen = strlen(cmd);
+	if (write(fd, cmd, cmdlen) != (ssize_t)cmdlen) {
+		close(fd);
+		return -1;
+	}
+	size_t total = 0;
+	ssize_t n;
+	while (total < buflen - 1
+			&& (n = read(fd, buf + total, buflen - 1 - total)) > 0) {
+		total += n;
+	}
+	close(fd);
+	buf[total] = '\0';
+	return total;
+}
+
+/*
+ * Parses the `monitors` reply. If want_id >= 0, writes that monitor's name
+ * to id_name. If focused_name is non-NULL, writes the focused monitor's
+ * name there. Returns 0 when everything requested was found.
+ */
+static int hypr_monitors(int want_id, char *id_name, size_t id_name_len,
+		char *focused_name, size_t focused_name_len) {
+	char buf[8192];
+	if (hypr_query("monitors", buf, sizeof(buf)) <= 0) {
+		return -1;
+	}
+	char cur[64] = "";
+	bool found_id = want_id < 0;
+	bool found_focused = focused_name == NULL;
+	char *save = NULL;
+	for (char *line = strtok_r(buf, "\n", &save); line;
+			line = strtok_r(NULL, "\n", &save)) {
+		char name[64];
+		int id;
+		if (sscanf(line, "Monitor %63s (ID %d):", name, &id) == 2) {
+			snprintf(cur, sizeof(cur), "%s", name);
+			if (want_id >= 0 && id == want_id && id_name) {
+				snprintf(id_name, id_name_len, "%s", name);
+				found_id = true;
+			}
+		} else if (focused_name && cur[0] && strstr(line, "focused: yes")) {
+			snprintf(focused_name, focused_name_len, "%s", cur);
+			found_focused = true;
+		}
+	}
+	return found_id && found_focused ? 0 : -1;
+}
+
+/*
+ * Logical geometry (layout position and size) of one monitor, accounting
+ * for scale and 90/270 degree transforms.
+ */
+static int hypr_monitor_geom(const char *mon,
+		int *x, int *y, int *w, int *h) {
+	char buf[8192];
+	if (hypr_query("monitors", buf, sizeof(buf)) <= 0) {
+		return -1;
+	}
+	char cur[64] = "";
+	int px = 0, py = 0, pw = 0, ph = 0, transform = 0;
+	float scale = 1.0f;
+	bool in_block = false, have_mode = false;
+	char *save = NULL;
+	for (char *line = strtok_r(buf, "\n", &save); line;
+			line = strtok_r(NULL, "\n", &save)) {
+		char name[64];
+		int id, mw, mh, mx, my;
+		float s;
+		if (sscanf(line, "Monitor %63s (ID %d):", name, &id) == 2) {
+			if (in_block) {
+				break; /* finished the block we wanted */
+			}
+			snprintf(cur, sizeof(cur), "%s", name);
+			in_block = strcmp(cur, mon) == 0;
+		} else if (in_block) {
+			if (sscanf(line, " %dx%d@%*f at %dx%d", &mw, &mh, &mx, &my) == 4) {
+				pw = mw;
+				ph = mh;
+				px = mx;
+				py = my;
+				have_mode = true;
+			} else if (sscanf(line, " scale: %f", &s) == 1) {
+				scale = s;
+			} else if (sscanf(line, " transform: %d", &transform) == 1) {
+				;
+			}
+		}
+	}
+	if (!have_mode || scale <= 0.0f) {
+		return -1;
+	}
+	if (transform % 2 == 1) {
+		int tmp = pw;
+		pw = ph;
+		ph = tmp;
+	}
+	*x = px;
+	*y = py;
+	*w = (int)(pw / scale);
+	*h = (int)(ph / scale);
+	return 0;
+}
+
+static int hypr_cursorpos(int *x, int *y) {
+	char buf[64];
+	if (hypr_query("cursorpos", buf, sizeof(buf)) <= 0) {
+		return -1;
+	}
+	return sscanf(buf, "%d, %d", x, y) == 2 ? 0 : -1;
+}
+
+/* Pointer highlight blob */
+
+static void blob_draw(struct wsk_state *state) {
+	int scale = state->blob_output ? state->blob_output->scale : 1;
+	int size = BLOB_RADIUS * 2 * scale;
+	if (!create_buffer(state->shm, &blob_buffer, size, size,
+			WL_SHM_FORMAT_ARGB8888)) {
+		return;
+	}
+	cairo_t *cr = blob_buffer.cairo;
+	cairo_save(cr);
+	cairo_set_operator(cr, CAIRO_OPERATOR_CLEAR);
+	cairo_paint(cr);
+	cairo_restore(cr);
+
+	double r = BLOB_RADIUS * scale;
+	double ring = BLOB_RING * scale;
+	/* translucent amber fill with a strong orange ring: high contrast on
+	 * both dark and light backgrounds */
+	cairo_arc(cr, r, r, r - ring, 0, 2 * BLOB_PI);
+	cairo_set_source_rgba(cr, 1.0, 0.78, 0.0, 0.30);
+	cairo_fill_preserve(cr);
+	cairo_set_line_width(cr, ring);
+	cairo_set_source_rgba(cr, 1.0, 0.27, 0.0, 0.95);
+	cairo_stroke(cr);
+
+	wl_surface_set_buffer_scale(state->blob_surface, scale);
+	wl_surface_attach(state->blob_surface, blob_buffer.buffer, 0, 0);
+	wl_surface_damage_buffer(state->blob_surface, 0, 0, size, size);
+	wl_surface_commit(state->blob_surface);
+	destroy_buffer(&blob_buffer);
+}
+
+static void blob_hide(struct wsk_state *state) {
+	state->blob_want = false;
+	if (state->blob_status == SURFACE_READY) {
+		wl_surface_attach(state->blob_surface, NULL, 0, 0);
+		wl_surface_commit(state->blob_surface);
+	}
+	if (state->blob_status != SURFACE_AWAIT_CONFIGURE) {
+		state->blob_status = SURFACE_UNMAPPED;
+	}
+}
+
+static void blob_layer_configure(void *data,
+		struct zwlr_layer_surface_v1 *layer, uint32_t serial,
+		uint32_t width, uint32_t height) {
+	struct wsk_state *state = data;
+	zwlr_layer_surface_v1_ack_configure(layer, serial);
+	if (state->blob_status == SURFACE_AWAIT_CONFIGURE) {
+		if (state->blob_want) {
+			state->blob_status = SURFACE_READY;
+			blob_draw(state);
+		} else {
+			state->blob_status = SURFACE_UNMAPPED;
+		}
+	}
+}
+
+static void blob_layer_closed(void *data,
+		struct zwlr_layer_surface_v1 *layer) {
+	struct wsk_state *state = data;
+	state->pointer_blob = false;
+}
+
+static const struct zwlr_layer_surface_v1_listener blob_layer_listener = {
+	.configure = blob_layer_configure,
+	.closed = blob_layer_closed,
+};
+
+static void blob_surface_enter(void *data,
+		struct wl_surface *wl_surface, struct wl_output *output) {
+	struct wsk_state *state = data;
+	struct wsk_output *o = state->outputs;
+	while (o && o->output != output) {
+		o = o->next;
+	}
+	state->blob_output = o;
+}
+
+static void blob_surface_leave(void *data,
+		struct wl_surface *wl_surface, struct wl_output *output) {
+	// Who cares
+}
+
+static const struct wl_surface_listener blob_surface_listener = {
+	.enter = blob_surface_enter,
+	.leave = blob_surface_leave,
+};
+
+static void blob_update(struct wsk_state *state) {
+	state->pointer_motion = false;
+	clock_gettime(CLOCK_MONOTONIC, &state->last_blob);
+
+	if (state->focus_gated && !state->target_focused) {
+		blob_hide(state);
+		return;
+	}
+
+	int cx, cy;
+	if (hypr_cursorpos(&cx, &cy) != 0) {
+		return;
+	}
+
+	/* Which monitor is the blob surface on? */
+	const char *mon = state->target_output[0] ? state->target_output
+			: (state->blob_output && state->blob_output->name[0]
+				? state->blob_output->name
+				: state->focused_output);
+	if (!mon[0]) {
+		return;
+	}
+	if (strcmp(state->blob_geom_output, mon) != 0) {
+		if (hypr_monitor_geom(mon, &state->blob_mon_x, &state->blob_mon_y,
+				&state->blob_mon_w, &state->blob_mon_h) != 0) {
+			return;
+		}
+		snprintf(state->blob_geom_output,
+				sizeof(state->blob_geom_output), "%s", mon);
+	}
+
+	int lx = cx - state->blob_mon_x;
+	int ly = cy - state->blob_mon_y;
+	if (lx < 0 || ly < 0 || lx >= state->blob_mon_w
+			|| ly >= state->blob_mon_h) {
+		/* cursor is on another monitor */
+		blob_hide(state);
+		return;
+	}
+
+	state->blob_want = true;
+	zwlr_layer_surface_v1_set_margin(state->blob_layer,
+			ly - BLOB_RADIUS, 0, 0, lx - BLOB_RADIUS);
+	if (state->blob_status == SURFACE_UNMAPPED) {
+		/* map: commit without a buffer and wait for configure */
+		wl_surface_commit(state->blob_surface);
+		state->blob_status = SURFACE_AWAIT_CONFIGURE;
+	} else if (state->blob_status == SURFACE_READY) {
+		wl_surface_commit(state->blob_surface);
+	}
+}
+
+/* Hyprland event socket: track the focused monitor */
+static void hypr_handle_events(struct wsk_state *state) {
+	char buf[1024];
+	ssize_t n = recv(state->hypr_event_fd, buf, sizeof(buf), 0);
+	if (n <= 0) {
+		close(state->hypr_event_fd);
+		state->hypr_event_fd = -1;
+		if (state->focus_gated) {
+			state->focus_gated = false;
+			state->target_focused = true;
+		}
+		fprintf(stderr, "wshowkeys: lost Hyprland event socket; "
+				"focus-based hiding disabled\n");
+		return;
+	}
+	for (ssize_t i = 0; i < n; ++i) {
+		char c = buf[i];
+		if (c != '\n') {
+			if (state->hypr_buf_len < sizeof(state->hypr_buf) - 1) {
+				state->hypr_buf[state->hypr_buf_len++] = c;
+			}
+			continue;
+		}
+		state->hypr_buf[state->hypr_buf_len] = '\0';
+		state->hypr_buf_len = 0;
+		const char *line = state->hypr_buf;
+		if (strncmp(line, "focusedmon>>", 12) != 0) {
+			continue;
+		}
+		const char *name = line + 12;
+		const char *comma = strchr(name, ',');
+		size_t namelen = comma ? (size_t)(comma - name) : strlen(name);
+		if (namelen >= sizeof(state->focused_output)) {
+			namelen = sizeof(state->focused_output) - 1;
+		}
+		memcpy(state->focused_output, name, namelen);
+		state->focused_output[namelen] = '\0';
+
+		if (!state->focus_gated) {
+			continue;
+		}
+		bool focused =
+			strcmp(state->focused_output, state->target_output) == 0;
+		if (focused != state->target_focused) {
+			state->target_focused = focused;
+			if (!focused) {
+				clear_full_keylink(state->keys, state);
+				if (state->pointer_blob) {
+					blob_hide(state);
+				}
+			}
+		}
+	}
+}
+
+/*
+ * Single instance per user, which doubles as a toggle: if another instance
+ * already holds the lock, terminate it and exit. fcntl() locks vanish with
+ * the process, so a crashed instance never wedges the toggle.
+ */
+static int single_instance(void) {
+	char path[256];
+	const char *dir = getenv("XDG_RUNTIME_DIR");
+	int n;
+	if (dir && dir[0]) {
+		n = snprintf(path, sizeof(path), "%s/wshowkeys.lock", dir);
+	} else {
+		n = snprintf(path, sizeof(path), "/tmp/wshowkeys-%d.lock",
+				(int)getuid());
+	}
+	if (n < 0 || (size_t)n >= sizeof(path)) {
+		return -1;
+	}
+	int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+	if (fd < 0) {
+		fprintf(stderr, "wshowkeys: open %s: %s\n", path, strerror(errno));
+		return -1;
+	}
+	struct flock lock = { .l_type = F_WRLCK, .l_whence = SEEK_SET };
+	if (fcntl(fd, F_SETLK, &lock) == 0) {
+		/* We are the instance; hold fd (and lock) for our lifetime. */
+		return 0;
+	}
+	struct flock holder = { .l_type = F_WRLCK, .l_whence = SEEK_SET };
+	if (fcntl(fd, F_GETLK, &holder) == 0 && holder.l_type != F_UNLCK
+			&& holder.l_pid > 0) {
+		kill(holder.l_pid, SIGTERM);
+		fprintf(stderr, "wshowkeys: toggled off running instance "
+				"(pid %d)\n", (int)holder.l_pid);
+	}
+	close(fd);
+	return 1;
+}
+
+static bool str_is_number(const char *s) {
+	if (!*s) {
+		return false;
+	}
+	for (; *s; ++s) {
+		if (!isdigit((unsigned char)*s)) {
+			return false;
+		}
+	}
+	return true;
+}
+
 int main(int argc, char *argv[]) {
 	/* NOTICE: This code runs as root */
 	struct wsk_state state = { 0 };
@@ -913,16 +1396,36 @@ int main(int argc, char *argv[]) {
 	}
 
 	/* Begin normal user code: */
+	switch (single_instance()) {
+	case 1:
+		/* Toggled off a running instance */
+		devmgr_finish(state.devmgr, state.devmgr_pid);
+		return 0;
+	case -1:
+		fprintf(stderr, "wshowkeys: instance lock unavailable; "
+				"toggling will not work\n");
+		break;
+	}
+
+	struct sigaction sa = { .sa_handler = handle_signal };
+	sigaction(SIGTERM, &sa, NULL);
+	sigaction(SIGINT, &sa, NULL);
+	signal(SIGPIPE, SIG_IGN);
+
 	int ret = 0;
 
 	unsigned int anchor = 0;
 	int margin = 32;
-	state.background = 0x000000CC;
-	state.specialfg = 0xAAAAAAFF;
+	const char *output_opt = NULL;
+	bool pointer_blob_opt = false;
+	state.background = 0x000000D9;
+	state.specialfg = 0xFFD000FF;
 	state.foreground = 0xFFFFFFFF;
 	state.font = "Sans Bold 40";
 	state.timeout = 200;
 	state.length_limit = 100;
+	state.hypr_event_fd = -1;
+	state.target_focused = true;
 	state.ctrl_l_hold = 0;
 	state.ctrl_r_hold = 0;
 	state.alt_l_hold = 0;
@@ -934,7 +1437,7 @@ int main(int argc, char *argv[]) {
 	state.combination_keye_repetition = 1;
 
 	int c;
-	while ((c = getopt(argc, argv, "hb:f:s:F:t:a:m:o:l:")) != -1) {
+	while ((c = getopt(argc, argv, "hb:f:s:F:t:a:m:o:l:p")) != -1) {
 		switch (c) {
 		case 'l':
 			state.length_limit = atoi(optarg);
@@ -969,12 +1472,20 @@ int main(int argc, char *argv[]) {
 			margin = atoi(optarg);
 			break;
 		case 'o':
-			fprintf(stderr, "-o is unimplemented\n");
-			return 0;
+			output_opt = optarg;
+			break;
+		case 'p':
+			pointer_blob_opt = true;
+			break;
 		default:
 			fprintf(stderr, "usage: wshowkeys [-b|-f|-s #RRGGBB[AA]] [-F font] "
 					"[-t timeout]\n\t[-a top|left|right|bottom] [-m margin] "
-					"[-o output] [-l numOfLengthLimit]");
+					"[-o output] [-l numOfLengthLimit] [-p]\n"
+					"\t-o: monitor name (e.g. DP-1) or Hyprland monitor ID; "
+					"only shown\n\t    while that monitor is focused\n"
+					"\t-p: highlight the mouse pointer (requires Hyprland)\n"
+					"\trunning wshowkeys while another instance is active "
+					"toggles it off\n");
 			return 1;
 		}
 	}
@@ -1036,15 +1547,108 @@ int main(int argc, char *argv[]) {
 
 	wl_seat_add_listener(state.seat, &wl_seat_listener, &state);
 	wl_display_roundtrip(state.display);
-	
+
+	bool hypr_ok = hypr_monitors(-1, NULL, 0,
+			state.focused_output, sizeof(state.focused_output)) == 0;
+
+	struct wl_output *target_wl_output = NULL;
+	if (output_opt) {
+		char target_name[64];
+		if (str_is_number(output_opt)) {
+			if (!hypr_ok || hypr_monitors(atoi(output_opt), target_name,
+					sizeof(target_name), NULL, 0) != 0) {
+				fprintf(stderr, "Unable to resolve monitor ID %s via "
+						"Hyprland IPC\n", output_opt);
+				ret = 1;
+				goto exit;
+			}
+		} else {
+			int n = snprintf(target_name, sizeof(target_name),
+					"%s", output_opt);
+			if (n < 0 || (size_t)n >= sizeof(target_name)) {
+				fprintf(stderr, "Output name too long\n");
+				ret = 1;
+				goto exit;
+			}
+		}
+		struct wsk_output *o = state.outputs;
+		while (o && strcmp(o->name, target_name) != 0) {
+			o = o->next;
+		}
+		if (!o) {
+			fprintf(stderr, "Output '%s' not found; available outputs:",
+					target_name);
+			for (o = state.outputs; o; o = o->next) {
+				fprintf(stderr, " %s", o->name[0] ? o->name : "(unnamed)");
+			}
+			fprintf(stderr, "\n");
+			ret = 1;
+			goto exit;
+		}
+		target_wl_output = o->output;
+		snprintf(state.target_output, sizeof(state.target_output),
+				"%s", target_name);
+
+		if (hypr_ok) {
+			state.focus_gated = true;
+			state.target_focused =
+				strcmp(state.focused_output, state.target_output) == 0;
+		} else {
+			fprintf(stderr, "wshowkeys: Hyprland IPC unavailable; "
+					"focus-based hiding disabled\n");
+		}
+	}
+
+	if (output_opt || pointer_blob_opt) {
+		state.hypr_event_fd = hypr_ok ? hypr_connect(".socket2.sock") : -1;
+		if (state.hypr_event_fd < 0 && state.focus_gated) {
+			fprintf(stderr, "wshowkeys: Hyprland event socket unavailable; "
+					"focus-based hiding disabled\n");
+			state.focus_gated = false;
+			state.target_focused = true;
+		}
+	}
+
 	state.surface = wl_compositor_create_surface(state.compositor);
 	assert(state.surface);
 	wl_surface_add_listener(state.surface, &wl_surface_listener, &state);
 
 	state.layer_surface = zwlr_layer_shell_v1_get_layer_surface(
-			state.layer_shell, state.surface, NULL,
+			state.layer_shell, state.surface, target_wl_output,
 			ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY, "showkeys");
 	assert(state.layer_surface);
+
+	if (pointer_blob_opt) {
+		if (!hypr_ok) {
+			fprintf(stderr, "wshowkeys: -p requires Hyprland IPC; "
+					"pointer highlight disabled\n");
+		} else {
+			state.blob_surface =
+				wl_compositor_create_surface(state.compositor);
+			assert(state.blob_surface);
+			wl_surface_add_listener(state.blob_surface,
+					&blob_surface_listener, &state);
+			struct wl_region *blob_region =
+				wl_compositor_create_region(state.compositor);
+			wl_surface_set_input_region(state.blob_surface, blob_region);
+			wl_region_destroy(blob_region);
+
+			state.blob_layer = zwlr_layer_shell_v1_get_layer_surface(
+					state.layer_shell, state.blob_surface, target_wl_output,
+					ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY, "wshowkeys-pointer");
+			assert(state.blob_layer);
+			zwlr_layer_surface_v1_add_listener(state.blob_layer,
+					&blob_layer_listener, &state);
+			zwlr_layer_surface_v1_set_size(state.blob_layer,
+					BLOB_RADIUS * 2, BLOB_RADIUS * 2);
+			zwlr_layer_surface_v1_set_anchor(state.blob_layer,
+					ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP
+					| ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT);
+			zwlr_layer_surface_v1_set_exclusive_zone(state.blob_layer, -1);
+			/* Mapped on first pointer motion */
+			state.pointer_blob = true;
+		}
+	}
 
 	// 创建空的输入区域
 	struct wl_region *input_region = wl_compositor_create_region(state.compositor);
@@ -1059,14 +1663,17 @@ int main(int argc, char *argv[]) {
 			margin, margin, margin, margin);
 	zwlr_layer_surface_v1_set_exclusive_zone(state.layer_surface, -1);
 	wl_surface_commit(state.surface);
+	state.surface_status = SURFACE_AWAIT_CONFIGURE;
 
-	struct pollfd pollfds[] = {
+	struct pollfd pollfds[3] = {
 		{ .fd = libinput_get_fd(state.libinput), .events = POLLIN, },
 		{ .fd = wl_display_get_fd(state.display), .events = POLLIN, },
+		{ .fd = state.hypr_event_fd, .events = POLLIN, },
 	};
+	nfds_t nfds = state.hypr_event_fd >= 0 ? 3 : 2;
 
 	state.run = true;
-	while (state.run) {
+	while (state.run && !terminate_requested) {
 		errno = 0;
 		do {
 			if (wl_display_flush(state.display) == -1 && errno != EAGAIN) {
@@ -1079,8 +1686,14 @@ int main(int argc, char *argv[]) {
 		if (state.keys) {
 			timeout = 200;
 		}
+		if (state.pointer_blob && state.pointer_motion) {
+			timeout = 16;
+		}
 
-		if (poll(pollfds, sizeof(pollfds) / sizeof(pollfds[0]), timeout) < 0) {
+		if (poll(pollfds, nfds, timeout) < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
 			fprintf(stderr, "poll: %s\n", strerror(errno));
 			break;
 		}
@@ -1131,6 +1744,23 @@ int main(int argc, char *argv[]) {
 			}
 		}
 
+		if (state.pointer_blob && state.pointer_motion) {
+			/* throttle pointer-position IPC queries to ~60Hz */
+			clock_gettime(CLOCK_MONOTONIC, &now);
+			long ms = (now.tv_sec - state.last_blob.tv_sec) * 1000
+				+ (now.tv_nsec - state.last_blob.tv_nsec) / 1000000;
+			if (ms >= 16 || ms < 0) {
+				blob_update(&state);
+			}
+		}
+
+		if (nfds > 2 && (pollfds[2].revents & (POLLIN | POLLHUP | POLLERR))) {
+			hypr_handle_events(&state);
+			if (state.hypr_event_fd < 0) {
+				nfds = 2;
+			}
+		}
+
 		if ((pollfds[1].revents & POLLIN)
 				&& wl_display_dispatch(state.display) == -1) {
 			fprintf(stderr, "wl_display_dispatch: %s\n", strerror(errno));
@@ -1139,8 +1769,15 @@ int main(int argc, char *argv[]) {
 	}
 
 exit:
-	wl_display_disconnect(state.display);
-	libinput_unref(state.libinput);
+	if (state.hypr_event_fd >= 0) {
+		close(state.hypr_event_fd);
+	}
+	if (state.display) {
+		wl_display_disconnect(state.display);
+	}
+	if (state.libinput) {
+		libinput_unref(state.libinput);
+	}
 	devmgr_finish(state.devmgr, state.devmgr_pid);
 	return ret;
 }
