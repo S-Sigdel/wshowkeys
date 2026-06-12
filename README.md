@@ -53,6 +53,15 @@ hides everything whenever another monitor has focus. The defaults are
 tuned for visibility on dark editor/3D-viewport style screens; tweak
 colors per the options below if needed.
 
+wshowkeys disables Hyprland layer animations for its own surfaces at
+startup so the pointer blob tracks in real time. If your Hyprland
+version ignores dynamic layerrules, add them statically instead:
+
+```conf
+layerrule = noanim, ^(wshowkeys-pointer)$
+layerrule = noanim, ^(showkeys)$
+```
+
 ## Usage
 
 ```

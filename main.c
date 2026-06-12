@@ -33,6 +33,7 @@ static struct pool_buffer blob_buffer;
 #define BLOB_RADIUS 42
 #define BLOB_RING 5
 #define BLOB_PI 3.14159265358979323846
+#define BLOB_INTERVAL_MS 8
 
 struct wsk_keypress {
 	xkb_keysym_t sym;
@@ -1551,6 +1552,17 @@ int main(int argc, char *argv[]) {
 	bool hypr_ok = hypr_monitors(-1, NULL, 0,
 			state.focused_output, sizeof(state.focused_output)) == 0;
 
+	if (hypr_ok) {
+		/* Hyprland tweens layer-surface position changes; the blob is
+		 * moved via margins, so animations would make it trail the
+		 * pointer. Disable them for our namespaces. */
+		char reply[64];
+		hypr_query("keyword layerrule noanim, ^(wshowkeys-pointer)$",
+				reply, sizeof(reply));
+		hypr_query("keyword layerrule noanim, ^(showkeys)$",
+				reply, sizeof(reply));
+	}
+
 	struct wl_output *target_wl_output = NULL;
 	if (output_opt) {
 		char target_name[64];
@@ -1687,7 +1699,7 @@ int main(int argc, char *argv[]) {
 			timeout = 200;
 		}
 		if (state.pointer_blob && state.pointer_motion) {
-			timeout = 16;
+			timeout = BLOB_INTERVAL_MS;
 		}
 
 		if (poll(pollfds, nfds, timeout) < 0) {
@@ -1745,11 +1757,11 @@ int main(int argc, char *argv[]) {
 		}
 
 		if (state.pointer_blob && state.pointer_motion) {
-			/* throttle pointer-position IPC queries to ~60Hz */
+			/* throttle pointer-position IPC queries */
 			clock_gettime(CLOCK_MONOTONIC, &now);
 			long ms = (now.tv_sec - state.last_blob.tv_sec) * 1000
 				+ (now.tv_nsec - state.last_blob.tv_nsec) / 1000000;
-			if (ms >= 16 || ms < 0) {
+			if (ms >= BLOB_INTERVAL_MS || ms < 0) {
 				blob_update(&state);
 			}
 		}
