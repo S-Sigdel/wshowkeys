@@ -16,7 +16,12 @@ https://github.com/DreamMaoMao/wshowkeys
 
 - On-screen keypresses, with modifier combinations (`Ctrl+`, `Super+`, …)
   and a repeat counter for held keys
-- `-p`: bright amber blob tracking the mouse pointer (Hyprland)
+- Mouse input in the same overlay: `LMB`/`MMB`/`RMB` clicks and scroll
+  direction, combined with held modifiers (`Shift+MMB`)
+- `-p`: surrounds the mouse cursor itself with a gold halo by swapping in
+  a generated cursor theme — rendered as the hardware cursor, so it is
+  pixel-locked to the pointer with zero lag; your cursor is restored when
+  toggled off (Hyprland)
 - `-o`: pin the overlay to one monitor — by Hyprland monitor ID (`0`, `1`,
   `2`, … as shown by `hyprctl monitors`) or by name (`DP-1`, `eDP-1`) — and
   show it **only while that monitor is focused**
@@ -55,12 +60,11 @@ another monitor has focus. Use a monitor ID or name instead of
 tuned for visibility on dark editor/3D-viewport style screens; tweak
 colors per the options below if needed.
 
-wshowkeys disables Hyprland layer animations for its own surfaces at
-startup so the pointer blob tracks in real time. If your Hyprland
-version ignores dynamic layerrules, add them statically instead:
+wshowkeys disables Hyprland layer animations for its overlay at startup
+so keys appear instantly. If your Hyprland version ignores dynamic
+layerrules, add it statically instead:
 
 ```conf
-layerrule = noanim, ^(wshowkeys-pointer)$
 layerrule = noanim, ^(showkeys)$
 ```
 
@@ -83,4 +87,5 @@ wshowkeys [-b|-f|-s #RRGGBB[AA]] [-F font] [-t timeout]
 - `-o output`: monitor to show on — Hyprland ID (`hyprctl monitors`),
   name (`DP-1`), or `focused` to pin to the monitor focused at launch.
   The overlay only appears while this monitor is focused.
-- `-p`: highlight the mouse pointer with a tracking blob (Hyprland)
+- `-p`: halo the mouse cursor while running; the previous cursor theme
+  (`$XCURSOR_THEME`) is restored on exit (Hyprland)

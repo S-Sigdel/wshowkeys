@@ -54,6 +54,7 @@ subdir('protocols')
 executable(
 	'wshowkeys',
 	files(
+		'cursor.c',
 		'devmgr.c',
 		'main.c',
 		'pango.c',

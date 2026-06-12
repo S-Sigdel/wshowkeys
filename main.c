@@ -6,6 +6,7 @@
 #include <getopt.h>
 #include <libinput.h>
 #include <libudev.h>
+#include <linux/input-event-codes.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -20,6 +21,7 @@
 #include <unistd.h>
 #include <wayland-client.h>
 #include <xkbcommon/xkbcommon.h>
+#include "cursor.h"
 #include "devmgr.h"
 #include "shm.h"
 #include "pango.h"
@@ -27,13 +29,6 @@
 #include "xdg-output-unstable-v1-client-protocol.h"
 
 static struct pool_buffer buffer;
-static struct pool_buffer blob_buffer;
-
-/* Pointer highlight blob: logical pixels */
-#define BLOB_RADIUS 42
-#define BLOB_RING 5
-#define BLOB_PI 3.14159265358979323846
-#define BLOB_INTERVAL_MS 8
 
 struct wsk_keypress {
 	xkb_keysym_t sym;
@@ -118,18 +113,6 @@ struct wsk_state {
 	int hypr_event_fd;
 	char hypr_buf[256];
 	size_t hypr_buf_len;
-
-	/* -p pointer highlight blob */
-	bool pointer_blob;
-	bool blob_want;
-	bool pointer_motion;
-	struct wl_surface *blob_surface;
-	struct zwlr_layer_surface_v1 *blob_layer;
-	enum wsk_surface_status blob_status;
-	struct wsk_output *blob_output;
-	struct timespec last_blob;
-	char blob_geom_output[64];
-	int blob_mon_x, blob_mon_y, blob_mon_w, blob_mon_h;
 };
 
 static volatile sig_atomic_t terminate_requested;
@@ -734,13 +717,160 @@ static void attach_repeat_flag(struct wsk_state *state,int num,int num_len) {
 
 }
 
+/*
+ * Appends a pressed key (or mouse button) to the keylink, prefixed with any
+ * held modifiers, and folds repeats into a counter.
+ */
+static void record_keypress(struct wsk_state *state,
+		struct wsk_keypress *keypress) {
+	memset(state->current_combination_key, 0,
+			sizeof(state->current_combination_key));
+	int special_key_num = 0;
+
+	struct wsk_keypress **link = &state->keys;
+	//get the end of the output keylink
+	while (*link) {
+		link = &(*link)->next;
+	}
+
+	// if 'ctrl shift alt super' still press,make a key node to output end
+	if(state->shift_l_hold) {
+		struct wsk_keypress *temp_keypress = calloc(1, sizeof(struct wsk_keypress));
+		strcpy(temp_keypress->name,"Shift_L");
+		strcat(state->current_combination_key, "Shift_L");
+		special_key_num ++;
+		*link = temp_keypress;
+		link = &(*link)->next;
+	}
+	if(state->shift_r_hold) {
+		struct wsk_keypress *temp_keypress = calloc(1, sizeof(struct wsk_keypress));
+		strcpy(temp_keypress->name,"Shift_R");
+		strcat(state->current_combination_key, "Shift_R");
+		special_key_num ++;
+		*link = temp_keypress;
+		link = &(*link)->next;
+	}
+	if(state->ctrl_l_hold) {
+		struct wsk_keypress *temp_keypress = calloc(1, sizeof(struct wsk_keypress));
+		strcpy(temp_keypress->name,"Control_L");
+		strcat(state->current_combination_key, "Control_L");
+		special_key_num ++;
+		*link = temp_keypress;
+		link = &(*link)->next;
+	}
+	if(state->ctrl_r_hold) {
+		struct wsk_keypress *temp_keypress = calloc(1, sizeof(struct wsk_keypress));
+		strcpy(temp_keypress->name,"Control_R");
+		strcat(state->current_combination_key, "Control_R");
+		special_key_num ++;
+		*link = temp_keypress;
+		link = &(*link)->next;
+	}
+	if(state->super_l_hold) {
+		struct wsk_keypress *temp_keypress = calloc(1, sizeof(struct wsk_keypress));
+		strcpy(temp_keypress->name,"Super_L");
+		strcat(state->current_combination_key, "Super_L");
+		special_key_num ++;
+		*link = temp_keypress;
+		link = &(*link)->next;
+	}
+	if(state->supre_r_hold) {
+		struct wsk_keypress *temp_keypress = calloc(1, sizeof(struct wsk_keypress));
+		strcpy(temp_keypress->name,"Super_R");
+		strcat(state->current_combination_key, "Super_R");
+		special_key_num ++;
+		*link = temp_keypress;
+		link = &(*link)->next;
+	}
+	if(state->alt_l_hold) {
+		struct wsk_keypress *temp_keypress = calloc(1, sizeof(struct wsk_keypress));
+		strcpy(temp_keypress->name,"Alt_L");
+		strcat(state->current_combination_key, "Alt_L");
+		special_key_num ++;
+		*link = temp_keypress;
+		link = &(*link)->next;
+	}
+	if(state->alt_r_hold) {
+		struct wsk_keypress *temp_keypress = calloc(1, sizeof(struct wsk_keypress));
+		strcpy(temp_keypress->name,"Alt_R");
+		strcat(state->current_combination_key, "Alt_R");
+		special_key_num ++;
+		*link = temp_keypress;
+		link = &(*link)->next;
+	}
+
+	//add other key to end of output keylink
+	*link = keypress;
+	strcat(state->current_combination_key, keypress->name);
+	special_key_num ++;
+
+	// detect repeat key
+	if (strcmp(state->prev_combination_keye,"") != 0 && strcmp(state->prev_combination_keye,state->current_combination_key) == 0) {
+
+		int del_charnum = caculat_del_charnum_of_int(state->combination_keye_repetition);
+		if (state->combination_keye_repetition > 2)
+			del_last_key(state,special_key_num + del_charnum);
+
+		state->combination_keye_repetition ++;
+
+		if (state->combination_keye_repetition > 2) {
+			int add_charnum = caculat_add_charnum_of_int(state->combination_keye_repetition);
+			attach_repeat_flag(state,state->combination_keye_repetition,add_charnum);
+		}
+	} else {
+		memset(state->prev_combination_keye, 0, sizeof(state->prev_combination_keye));
+		strcat(state->prev_combination_keye, state->current_combination_key);
+		state->combination_keye_repetition = 1;
+	}
+}
+
 //listen key keydown and record to keylink
 static void handle_libinput_event(struct wsk_state *state,
 		struct libinput_event *event) {
 	enum libinput_event_type event_type = libinput_event_get_type(event);
-	if (event_type == LIBINPUT_EVENT_POINTER_MOTION
-			|| event_type == LIBINPUT_EVENT_POINTER_MOTION_ABSOLUTE) {
-		state->pointer_motion = true;
+
+	if (event_type == LIBINPUT_EVENT_POINTER_BUTTON
+			|| event_type == LIBINPUT_EVENT_POINTER_SCROLL_WHEEL) {
+		if (state->focus_gated && !state->target_focused) {
+			return;
+		}
+		struct libinput_event_pointer *pev =
+			libinput_event_get_pointer_event(event);
+		const char *name = NULL;
+		if (event_type == LIBINPUT_EVENT_POINTER_BUTTON) {
+			if (libinput_event_pointer_get_button_state(pev)
+					!= LIBINPUT_BUTTON_STATE_PRESSED) {
+				return;
+			}
+			switch (libinput_event_pointer_get_button(pev)) {
+			case BTN_LEFT:
+				name = "LMB ";
+				break;
+			case BTN_MIDDLE:
+				name = "MMB ";
+				break;
+			case BTN_RIGHT:
+				name = "RMB ";
+				break;
+			default:
+				return;
+			}
+		} else {
+			if (!libinput_event_pointer_has_axis(pev,
+					LIBINPUT_POINTER_AXIS_SCROLL_VERTICAL)) {
+				return;
+			}
+			name = libinput_event_pointer_get_scroll_value(pev,
+					LIBINPUT_POINTER_AXIS_SCROLL_VERTICAL) < 0
+				? "⇡ " : "⇣ ";
+		}
+		struct wsk_keypress *keypress =
+			calloc(1, sizeof(struct wsk_keypress));
+		assert(keypress);
+		strcpy(keypress->name, name);
+		record_keypress(state, keypress);
+		clock_gettime(CLOCK_MONOTONIC, &state->last_key);
+		set_dirty(state);
 		return;
 	}
 
@@ -775,10 +905,6 @@ static void handle_libinput_event(struct wsk_state *state,
 			keypress->utf8[0] <= ' ') {
 		keypress->utf8[0] = '\0';
 	}
-
-	// clear current_combination_key
-	memset(state->current_combination_key, 0, sizeof(state->current_combination_key));
-	int special_key_num = 0;
 
 	switch (key_state) {
 	case LIBINPUT_KEY_STATE_RELEASED:
@@ -829,101 +955,7 @@ static void handle_libinput_event(struct wsk_state *state,
 			// target monitor not focused: don't record anything
 			free(keypress);
 		} else {
-			struct wsk_keypress **link = &state->keys;
-			//get the end of the output keylink
-			while (*link) {
-				link = &(*link)->next;
-			}
-
-			// if 'ctrl shift alt super' still press,make a key node to output end
-			if(state->shift_l_hold) {
-				struct wsk_keypress *temp_keypress = calloc(1, sizeof(struct wsk_keypress));
-				strcpy(temp_keypress->name,"Shift_L");
-				strcat(state->current_combination_key, "Shift_L"); 
-				special_key_num ++;
-				*link = temp_keypress;
-				link = &(*link)->next;
-			}
-			if(state->shift_r_hold) {
-				struct wsk_keypress *temp_keypress = calloc(1, sizeof(struct wsk_keypress));
-				strcpy(temp_keypress->name,"Shift_R");
-				strcat(state->current_combination_key, "Shift_R"); 
-				special_key_num ++;
-				*link = temp_keypress;
-				link = &(*link)->next;
-			}
-			if(state->ctrl_l_hold) {
-				struct wsk_keypress *temp_keypress = calloc(1, sizeof(struct wsk_keypress));
-				strcpy(temp_keypress->name,"Control_L");
-				strcat(state->current_combination_key, "Control_L"); 
-				special_key_num ++;
-				*link = temp_keypress;
-				link = &(*link)->next;
-			} 
-			if(state->ctrl_r_hold) {
-				struct wsk_keypress *temp_keypress = calloc(1, sizeof(struct wsk_keypress));
-				strcpy(temp_keypress->name,"Control_R");
-				strcat(state->current_combination_key, "Control_R"); 
-				special_key_num ++;
-				*link = temp_keypress;
-				link = &(*link)->next;
-			} 
-			if(state->super_l_hold) {
-				struct wsk_keypress *temp_keypress = calloc(1, sizeof(struct wsk_keypress));
-				strcpy(temp_keypress->name,"Super_L");
-				strcat(state->current_combination_key, "Super_L"); 
-				special_key_num ++;
-				*link = temp_keypress;
-				link = &(*link)->next;
-			}
-			if(state->supre_r_hold) {
-				struct wsk_keypress *temp_keypress = calloc(1, sizeof(struct wsk_keypress));
-				strcpy(temp_keypress->name,"Super_R");
-				strcat(state->current_combination_key, "Super_R"); 
-				special_key_num ++;
-				*link = temp_keypress;
-				link = &(*link)->next;
-			}
-			if(state->alt_l_hold) {
-				struct wsk_keypress *temp_keypress = calloc(1, sizeof(struct wsk_keypress));
-				strcpy(temp_keypress->name,"Alt_L");
-				strcat(state->current_combination_key, "Alt_L"); 
-				special_key_num ++;
-				*link = temp_keypress;
-				link = &(*link)->next;
-			}
-			if(state->alt_r_hold) {
-				struct wsk_keypress *temp_keypress = calloc(1, sizeof(struct wsk_keypress));
-				strcpy(temp_keypress->name,"Alt_R");
-				strcat(state->current_combination_key, "Alt_R"); 
-				special_key_num ++;
-				*link = temp_keypress;
-				link = &(*link)->next;
-			}
-
-			//add other key to end of output keylink
-			*link = keypress;
-			strcat(state->current_combination_key, keypress->name);
-			special_key_num ++;
-
-			// detect repeat key
-			if (strcmp(state->prev_combination_keye,"") != 0 && strcmp(state->prev_combination_keye,state->current_combination_key) == 0) {
-				
-				int del_charnum = caculat_del_charnum_of_int(state->combination_keye_repetition);
-				if (state->combination_keye_repetition > 2)
-					del_last_key(state,special_key_num + del_charnum);
-
-				state->combination_keye_repetition ++;
-
-				if (state->combination_keye_repetition > 2) {
-					int add_charnum = caculat_add_charnum_of_int(state->combination_keye_repetition);
-					attach_repeat_flag(state,state->combination_keye_repetition,add_charnum);
-				}
-			} else {
-				memset(state->prev_combination_keye, 0, sizeof(state->prev_combination_keye));
-				strcat(state->prev_combination_keye, state->current_combination_key);
-				state->combination_keye_repetition = 1; 
-			}
+			record_keypress(state, keypress);
 		}
 		break;
 	}
@@ -1078,211 +1110,6 @@ static int hypr_monitors(int want_id, char *id_name, size_t id_name_len,
 	return found_id && found_focused ? 0 : -1;
 }
 
-/*
- * Logical geometry (layout position and size) of one monitor, accounting
- * for scale and 90/270 degree transforms.
- */
-static int hypr_monitor_geom(const char *mon,
-		int *x, int *y, int *w, int *h) {
-	char buf[8192];
-	if (hypr_query("monitors", buf, sizeof(buf)) <= 0) {
-		return -1;
-	}
-	char cur[64] = "";
-	int px = 0, py = 0, pw = 0, ph = 0, transform = 0;
-	float scale = 1.0f;
-	bool in_block = false, have_mode = false;
-	char *save = NULL;
-	for (char *line = strtok_r(buf, "\n", &save); line;
-			line = strtok_r(NULL, "\n", &save)) {
-		char name[64];
-		int id, mw, mh, mx, my;
-		float s;
-		if (sscanf(line, "Monitor %63s (ID %d):", name, &id) == 2) {
-			if (in_block) {
-				break; /* finished the block we wanted */
-			}
-			snprintf(cur, sizeof(cur), "%s", name);
-			in_block = strcmp(cur, mon) == 0;
-		} else if (in_block) {
-			if (sscanf(line, " %dx%d@%*f at %dx%d", &mw, &mh, &mx, &my) == 4) {
-				pw = mw;
-				ph = mh;
-				px = mx;
-				py = my;
-				have_mode = true;
-			} else if (sscanf(line, " scale: %f", &s) == 1) {
-				scale = s;
-			} else if (sscanf(line, " transform: %d", &transform) == 1) {
-				;
-			}
-		}
-	}
-	if (!have_mode || scale <= 0.0f) {
-		return -1;
-	}
-	if (transform % 2 == 1) {
-		int tmp = pw;
-		pw = ph;
-		ph = tmp;
-	}
-	*x = px;
-	*y = py;
-	*w = (int)(pw / scale);
-	*h = (int)(ph / scale);
-	return 0;
-}
-
-static int hypr_cursorpos(int *x, int *y) {
-	char buf[64];
-	if (hypr_query("cursorpos", buf, sizeof(buf)) <= 0) {
-		return -1;
-	}
-	return sscanf(buf, "%d, %d", x, y) == 2 ? 0 : -1;
-}
-
-/* Pointer highlight blob */
-
-static void blob_draw(struct wsk_state *state) {
-	int scale = state->blob_output ? state->blob_output->scale : 1;
-	int size = BLOB_RADIUS * 2 * scale;
-	if (!create_buffer(state->shm, &blob_buffer, size, size,
-			WL_SHM_FORMAT_ARGB8888)) {
-		return;
-	}
-	cairo_t *cr = blob_buffer.cairo;
-	cairo_save(cr);
-	cairo_set_operator(cr, CAIRO_OPERATOR_CLEAR);
-	cairo_paint(cr);
-	cairo_restore(cr);
-
-	double r = BLOB_RADIUS * scale;
-	double ring = BLOB_RING * scale;
-	/* translucent amber fill with a strong orange ring: high contrast on
-	 * both dark and light backgrounds */
-	cairo_arc(cr, r, r, r - ring, 0, 2 * BLOB_PI);
-	cairo_set_source_rgba(cr, 1.0, 0.78, 0.0, 0.30);
-	cairo_fill_preserve(cr);
-	cairo_set_line_width(cr, ring);
-	cairo_set_source_rgba(cr, 1.0, 0.27, 0.0, 0.95);
-	cairo_stroke(cr);
-
-	wl_surface_set_buffer_scale(state->blob_surface, scale);
-	wl_surface_attach(state->blob_surface, blob_buffer.buffer, 0, 0);
-	wl_surface_damage_buffer(state->blob_surface, 0, 0, size, size);
-	wl_surface_commit(state->blob_surface);
-	destroy_buffer(&blob_buffer);
-}
-
-static void blob_hide(struct wsk_state *state) {
-	state->blob_want = false;
-	if (state->blob_status == SURFACE_READY) {
-		wl_surface_attach(state->blob_surface, NULL, 0, 0);
-		wl_surface_commit(state->blob_surface);
-	}
-	if (state->blob_status != SURFACE_AWAIT_CONFIGURE) {
-		state->blob_status = SURFACE_UNMAPPED;
-	}
-}
-
-static void blob_layer_configure(void *data,
-		struct zwlr_layer_surface_v1 *layer, uint32_t serial,
-		uint32_t width, uint32_t height) {
-	struct wsk_state *state = data;
-	zwlr_layer_surface_v1_ack_configure(layer, serial);
-	if (state->blob_status == SURFACE_AWAIT_CONFIGURE) {
-		if (state->blob_want) {
-			state->blob_status = SURFACE_READY;
-			blob_draw(state);
-		} else {
-			state->blob_status = SURFACE_UNMAPPED;
-		}
-	}
-}
-
-static void blob_layer_closed(void *data,
-		struct zwlr_layer_surface_v1 *layer) {
-	struct wsk_state *state = data;
-	state->pointer_blob = false;
-}
-
-static const struct zwlr_layer_surface_v1_listener blob_layer_listener = {
-	.configure = blob_layer_configure,
-	.closed = blob_layer_closed,
-};
-
-static void blob_surface_enter(void *data,
-		struct wl_surface *wl_surface, struct wl_output *output) {
-	struct wsk_state *state = data;
-	struct wsk_output *o = state->outputs;
-	while (o && o->output != output) {
-		o = o->next;
-	}
-	state->blob_output = o;
-}
-
-static void blob_surface_leave(void *data,
-		struct wl_surface *wl_surface, struct wl_output *output) {
-	// Who cares
-}
-
-static const struct wl_surface_listener blob_surface_listener = {
-	.enter = blob_surface_enter,
-	.leave = blob_surface_leave,
-};
-
-static void blob_update(struct wsk_state *state) {
-	state->pointer_motion = false;
-	clock_gettime(CLOCK_MONOTONIC, &state->last_blob);
-
-	if (state->focus_gated && !state->target_focused) {
-		blob_hide(state);
-		return;
-	}
-
-	int cx, cy;
-	if (hypr_cursorpos(&cx, &cy) != 0) {
-		return;
-	}
-
-	/* Which monitor is the blob surface on? */
-	const char *mon = state->target_output[0] ? state->target_output
-			: (state->blob_output && state->blob_output->name[0]
-				? state->blob_output->name
-				: state->focused_output);
-	if (!mon[0]) {
-		return;
-	}
-	if (strcmp(state->blob_geom_output, mon) != 0) {
-		if (hypr_monitor_geom(mon, &state->blob_mon_x, &state->blob_mon_y,
-				&state->blob_mon_w, &state->blob_mon_h) != 0) {
-			return;
-		}
-		snprintf(state->blob_geom_output,
-				sizeof(state->blob_geom_output), "%s", mon);
-	}
-
-	int lx = cx - state->blob_mon_x;
-	int ly = cy - state->blob_mon_y;
-	if (lx < 0 || ly < 0 || lx >= state->blob_mon_w
-			|| ly >= state->blob_mon_h) {
-		/* cursor is on another monitor */
-		blob_hide(state);
-		return;
-	}
-
-	state->blob_want = true;
-	zwlr_layer_surface_v1_set_margin(state->blob_layer,
-			ly - BLOB_RADIUS, 0, 0, lx - BLOB_RADIUS);
-	if (state->blob_status == SURFACE_UNMAPPED) {
-		/* map: commit without a buffer and wait for configure */
-		wl_surface_commit(state->blob_surface);
-		state->blob_status = SURFACE_AWAIT_CONFIGURE;
-	} else if (state->blob_status == SURFACE_READY) {
-		wl_surface_commit(state->blob_surface);
-	}
-}
-
 /* Hyprland event socket: track the focused monitor */
 static void hypr_handle_events(struct wsk_state *state) {
 	char buf[1024];
@@ -1330,9 +1157,6 @@ static void hypr_handle_events(struct wsk_state *state) {
 			state->target_focused = focused;
 			if (!focused) {
 				clear_full_keylink(state->keys, state);
-				if (state->pointer_blob) {
-					blob_hide(state);
-				}
 			}
 		}
 	}
@@ -1418,7 +1242,10 @@ int main(int argc, char *argv[]) {
 	unsigned int anchor = 0;
 	int margin = 32;
 	const char *output_opt = NULL;
-	bool pointer_blob_opt = false;
+	bool pointer_opt = false;
+	bool cursor_set = false;
+	const char *env_size = getenv("XCURSOR_SIZE");
+	int cursor_size = env_size && atoi(env_size) > 0 ? atoi(env_size) : 24;
 	state.background = 0x000000D9;
 	state.specialfg = 0xFFD000FF;
 	state.foreground = 0xFFFFFFFF;
@@ -1476,7 +1303,7 @@ int main(int argc, char *argv[]) {
 			output_opt = optarg;
 			break;
 		case 'p':
-			pointer_blob_opt = true;
+			pointer_opt = true;
 			break;
 		default:
 			fprintf(stderr, "usage: wshowkeys [-b|-f|-s #RRGGBB[AA]] [-F font] "
@@ -1485,7 +1312,8 @@ int main(int argc, char *argv[]) {
 					"\t-o: monitor name (e.g. DP-1), Hyprland monitor ID, or "
 					"'focused';\n\t    only shown while that monitor is "
 					"focused\n"
-					"\t-p: highlight the mouse pointer (requires Hyprland)\n"
+					"\t-p: halo the mouse cursor while running "
+					"(requires Hyprland)\n"
 					"\trunning wshowkeys while another instance is active "
 					"toggles it off\n");
 			return 1;
@@ -1554,12 +1382,9 @@ int main(int argc, char *argv[]) {
 			state.focused_output, sizeof(state.focused_output)) == 0;
 
 	if (hypr_ok) {
-		/* Hyprland tweens layer-surface position changes; the blob is
-		 * moved via margins, so animations would make it trail the
-		 * pointer. Disable them for our namespaces. */
+		/* the key overlay maps and unmaps constantly; layer animations
+		 * would make it slide in every time */
 		char reply[64];
-		hypr_query("keyword layerrule noanim, ^(wshowkeys-pointer)$",
-				reply, sizeof(reply));
 		hypr_query("keyword layerrule noanim, ^(showkeys)$",
 				reply, sizeof(reply));
 	}
@@ -1621,7 +1446,7 @@ int main(int argc, char *argv[]) {
 		}
 	}
 
-	if (output_opt || pointer_blob_opt) {
+	if (output_opt) {
 		state.hypr_event_fd = hypr_ok ? hypr_connect(".socket2.sock") : -1;
 		if (state.hypr_event_fd < 0 && state.focus_gated) {
 			fprintf(stderr, "wshowkeys: Hyprland event socket unavailable; "
@@ -1640,35 +1465,21 @@ int main(int argc, char *argv[]) {
 			ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY, "showkeys");
 	assert(state.layer_surface);
 
-	if (pointer_blob_opt) {
+	if (pointer_opt) {
+		/* Swap in a cursor theme that halos the pointer. The compositor
+		 * renders it as the actual cursor: zero latency, no chasing. */
 		if (!hypr_ok) {
 			fprintf(stderr, "wshowkeys: -p requires Hyprland IPC; "
 					"pointer highlight disabled\n");
+		} else if (cursor_theme_install() != 0) {
+			fprintf(stderr, "wshowkeys: failed to write cursor theme; "
+					"pointer highlight disabled\n");
 		} else {
-			state.blob_surface =
-				wl_compositor_create_surface(state.compositor);
-			assert(state.blob_surface);
-			wl_surface_add_listener(state.blob_surface,
-					&blob_surface_listener, &state);
-			struct wl_region *blob_region =
-				wl_compositor_create_region(state.compositor);
-			wl_surface_set_input_region(state.blob_surface, blob_region);
-			wl_region_destroy(blob_region);
-
-			state.blob_layer = zwlr_layer_shell_v1_get_layer_surface(
-					state.layer_shell, state.blob_surface, target_wl_output,
-					ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY, "wshowkeys-pointer");
-			assert(state.blob_layer);
-			zwlr_layer_surface_v1_add_listener(state.blob_layer,
-					&blob_layer_listener, &state);
-			zwlr_layer_surface_v1_set_size(state.blob_layer,
-					BLOB_RADIUS * 2, BLOB_RADIUS * 2);
-			zwlr_layer_surface_v1_set_anchor(state.blob_layer,
-					ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP
-					| ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT);
-			zwlr_layer_surface_v1_set_exclusive_zone(state.blob_layer, -1);
-			/* Mapped on first pointer motion */
-			state.pointer_blob = true;
+			char cmd[64], reply[64];
+			snprintf(cmd, sizeof(cmd), "setcursor wshowkeys-cursor %d",
+					cursor_size * 2);
+			hypr_query(cmd, reply, sizeof(reply));
+			cursor_set = true;
 		}
 	}
 
@@ -1707,9 +1518,6 @@ int main(int argc, char *argv[]) {
 		int timeout = -1;
 		if (state.keys) {
 			timeout = 200;
-		}
-		if (state.pointer_blob && state.pointer_motion) {
-			timeout = BLOB_INTERVAL_MS;
 		}
 
 		if (poll(pollfds, nfds, timeout) < 0) {
@@ -1766,16 +1574,6 @@ int main(int argc, char *argv[]) {
 			}
 		}
 
-		if (state.pointer_blob && state.pointer_motion) {
-			/* throttle pointer-position IPC queries */
-			clock_gettime(CLOCK_MONOTONIC, &now);
-			long ms = (now.tv_sec - state.last_blob.tv_sec) * 1000
-				+ (now.tv_nsec - state.last_blob.tv_nsec) / 1000000;
-			if (ms >= BLOB_INTERVAL_MS || ms < 0) {
-				blob_update(&state);
-			}
-		}
-
 		if (nfds > 2 && (pollfds[2].revents & (POLLIN | POLLHUP | POLLERR))) {
 			hypr_handle_events(&state);
 			if (state.hypr_event_fd < 0) {
@@ -1791,6 +1589,16 @@ int main(int argc, char *argv[]) {
 	}
 
 exit:
+	if (cursor_set) {
+		const char *theme = getenv("XCURSOR_THEME");
+		if (!theme || !theme[0]
+				|| strcmp(theme, "wshowkeys-cursor") == 0) {
+			theme = "default";
+		}
+		char cmd[192], reply[64];
+		snprintf(cmd, sizeof(cmd), "setcursor %s %d", theme, cursor_size);
+		hypr_query(cmd, reply, sizeof(reply));
+	}
 	if (state.hypr_event_fd >= 0) {
 		close(state.hypr_event_fd);
 	}
